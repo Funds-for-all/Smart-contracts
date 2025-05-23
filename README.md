@@ -10,3 +10,15 @@
 | `getVoteCount`  | View votes per candidate      | ✅ Simple and useful                   |
 | `poolCount`     | Track number of pools         | ✅ Works                               |
 | `pools`         | Mapping to each pool          | ✅ Accessible                          |
+
+
+
+
+## Tests results 
+✔ should create a new pool
+✔ should allow funding
+✔ should allow voting and withdrawal
+✔ should not allow double voting
+✔ should not allow withdrawal before any votes
+✔ should reject invalid candidate vote
+✔ should emit events correctly (100ms)
