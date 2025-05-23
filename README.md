@@ -22,3 +22,6 @@
 ✔ should not allow withdrawal before any votes
 ✔ should reject invalid candidate vote
 ✔ should emit events correctly (100ms)
+
+
+## note: https://kleros.io/integrations 
