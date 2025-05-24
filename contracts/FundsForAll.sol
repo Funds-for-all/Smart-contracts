@@ -1,96 +1,167 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.19;
 
-contract FundsForAll {
-    struct Pool {
-        address owner;
-        string name;
-        uint256 totalFunds;
-        bool withdrawn;
-        address[] voters;
-        mapping(address => uint256) votes;
-        mapping(address => bool) hasVoted;
-        address[] candidates;
+contract FundPoolFactory {
+    address[] public allPools;
+
+    event PoolCreated(address poolAddress, address creator, string name, uint goalAmount, uint deadline);
+
+    function createFundPool(
+        string memory _name,
+        uint _goalAmount,
+        uint _durationInDays
+    ) external {
+        uint deadline = block.timestamp + (_durationInDays * 1 days);
+        FundPool newPool = new FundPool(msg.sender, _name, _goalAmount, deadline);
+        allPools.push(address(newPool));
+        emit PoolCreated(address(newPool), msg.sender, _name, _goalAmount, deadline);
     }
 
-    uint256 public poolCount;
-    mapping(uint256 => Pool) public pools;
+    function getAllPools() external view returns (address[] memory) {
+        return allPools;
+    }
+}
 
-    event PoolCreated(uint256 poolId, address owner, string name);
-    event Funded(uint256 poolId, address funder, uint256 amount);
-    event Voted(uint256 poolId, address voter, address candidate);
-    event Withdrawn(uint256 poolId, address to, uint256 amount);
+contract FundPool {
+    address public creator;
+    string public name;
+    uint public goalAmount;
+    uint public deadline;
+    bool public isEnded;
+    bool public goalReached;
+    bool public hasWithdrawn;
 
-    modifier onlyOwner(uint256 poolId) {
-        require(msg.sender == pools[poolId].owner, "Not pool owner");
+    mapping(address => uint) public contributions;
+    mapping(address => bool) public hasVoted;
+
+    address[] public candidates;
+    mapping(address => uint) public candidateVotes;
+
+    event Funded(address indexed contributor, uint amount);
+    event Refunded(address indexed contributor, uint amount);
+    event PoolClosed(bool goalReached);
+    event Voted(address indexed voter, address indexed candidate);
+    event Withdrawn(address indexed to, uint amount);
+    event CandidateAdded(address indexed candidate);
+
+    modifier onlyCreator() {
+        require(msg.sender == creator, "Not the pool creator");
         _;
     }
 
-    function createPool(string calldata name, address[] calldata candidates) external {
-        Pool storage pool = pools[poolCount];
-        pool.owner = msg.sender;
-        pool.name = name;
-        pool.withdrawn = false;
-        pool.candidates = candidates;
-        emit PoolCreated(poolCount, msg.sender, name);
-        poolCount++;
+    modifier poolActive() {
+        require(!isEnded, "Pool has ended");
+        _;
     }
 
-    function fundPool(uint256 poolId) external payable {
-        require(msg.value > 0, "Must send funds");
-        Pool storage pool = pools[poolId];
-        pool.totalFunds += msg.value;
-        emit Funded(poolId, msg.sender, msg.value);
+    modifier poolEndedAndGoalReached() {
+        require(isEnded, "Pool not closed yet");
+        require(goalReached, "Goal not reached");
+        _;
     }
 
-    function vote(uint256 poolId, address candidate) external {
-        Pool storage pool = pools[poolId];
-        require(!pool.hasVoted[msg.sender], "Already voted");
+    constructor(address _creator, string memory _name, uint _goalAmount, uint _deadline) {
+        creator = _creator;
+        name = _name;
+        goalAmount = _goalAmount;
+        deadline = _deadline;
+    }
 
-        bool validCandidate = false;
-        for (uint256 i = 0; i < pool.candidates.length; i++) {
-            if (pool.candidates[i] == candidate) {
-                validCandidate = true;
+    // Add a candidate (can only be done by creator before deadline)
+    function addCandidate(address _candidate) external onlyCreator poolActive {
+        candidates.push(_candidate);
+        emit CandidateAdded(_candidate);
+    }
+
+    // Fund the pool
+    receive() external payable poolActive {
+        require(block.timestamp < deadline, "Funding period is over");
+        contributions[msg.sender] += msg.value;
+        emit Funded(msg.sender, msg.value);
+    }
+
+    // Close the pool after the deadline
+    function closePool() public {
+        require(!isEnded, "Pool already closed");
+        require(block.timestamp >= deadline, "Deadline not reached");
+        isEnded = true;
+        goalReached = address(this).balance >= goalAmount;
+        emit PoolClosed(goalReached);
+    }
+
+    // Vote for a candidate (only after pool is closed, only one vote per contributor)
+    function vote(address _candidate) external poolEndedAndGoalReached {
+        require(contributions[msg.sender] > 0, "Must have contributed to vote");
+        require(!hasVoted[msg.sender], "Already voted");
+
+        bool isValidCandidate = false;
+        for (uint i = 0; i < candidates.length; i++) {
+            if (candidates[i] == _candidate) {
+                isValidCandidate = true;
                 break;
             }
         }
-        require(validCandidate, "Invalid candidate");
+        require(isValidCandidate, "Invalid candidate");
 
-        pool.votes[candidate]++;
-        pool.hasVoted[msg.sender] = true;
-        pool.voters.push(msg.sender);
-        emit Voted(poolId, msg.sender, candidate);
+        hasVoted[msg.sender] = true;
+        candidateVotes[_candidate]++;
+        emit Voted(msg.sender, _candidate);
     }
 
-    function withdraw(uint256 poolId) external onlyOwner(poolId) {
-        Pool storage pool = pools[poolId];
-        require(!pool.withdrawn, "Already withdrawn");
+    // Withdraw funds to the most voted candidate
+    function withdrawToWinner() external poolEndedAndGoalReached {
+        require(!hasWithdrawn, "Funds already withdrawn");
 
-        address topCandidate;
-        uint256 highestVotes;
+        address winner = address(0);
+        uint highestVotes = 0;
 
-        for (uint256 i = 0; i < pool.candidates.length; i++) {
-            address candidate = pool.candidates[i];
-            if (pool.votes[candidate] > highestVotes) {
-                highestVotes = pool.votes[candidate];
-                topCandidate = candidate;
+        for (uint i = 0; i < candidates.length; i++) {
+            if (candidateVotes[candidates[i]] > highestVotes) {
+                highestVotes = candidateVotes[candidates[i]];
+                winner = candidates[i];
             }
         }
 
-        require(topCandidate != address(0), "No votes");
+        require(winner != address(0), "No votes cast");
 
-        uint256 amount = pool.totalFunds;
-        pool.totalFunds = 0;
-        pool.withdrawn = true;
-        payable(topCandidate).transfer(amount);
-        emit Withdrawn(poolId, topCandidate, amount);
+        hasWithdrawn = true;
+        uint amount = address(this).balance;
+        payable(winner).transfer(amount);
+        emit Withdrawn(winner, amount);
     }
 
-    function getCandidates(uint256 poolId) external view returns (address[] memory) {
-        return pools[poolId].candidates;
+    // Refunds for contributors if goal not met
+    function claimRefund() external {
+        require(isEnded, "Pool not closed yet");
+        require(!goalReached, "Goal was reached; no refunds");
+
+        uint amount = contributions[msg.sender];
+        require(amount > 0, "No contribution to refund");
+
+        contributions[msg.sender] = 0;
+        payable(msg.sender).transfer(amount);
+        emit Refunded(msg.sender, amount);
     }
 
-    function getVoteCount(uint256 poolId, address candidate) external view returns (uint256) {
-        return pools[poolId].votes[candidate];
+    // Views
+    function getBalance() external view returns (uint) {
+        return address(this).balance;
+    }
+
+    function timeLeft() external view returns (uint) {
+        if (block.timestamp >= deadline) return 0;
+        return deadline - block.timestamp;
+    }
+
+    function getMyContribution(address user) external view returns (uint) {
+        return contributions[user];
+    }
+
+    function getCandidates() external view returns (address[] memory) {
+        return candidates;
+    }
+
+    function getCandidateVotes(address candidate) external view returns (uint) {
+        return candidateVotes[candidate];
     }
 }
