@@ -165,3 +165,5 @@ contract FundPool {
         return candidateVotes[candidate];
     }
 }
+
+// 0x7aA03fd7Eb166417A4f31B103843036a3a805713
