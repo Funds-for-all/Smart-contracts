@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.19;
 
-contract FundPoolFactory {
+contract FundsForAll {
     address[] public allPools;
 
     event PoolCreated(address poolAddress, address creator, string name, uint goalAmount, uint deadline);
