@@ -1,75 +1,82 @@
 import { ethers } from "hardhat";
 import { expect } from "chai";
-import { FundsForAll } from "../typechain-types";
 
-describe("FundsForAll", function () {
-  let contract: FundsForAll;
-  let owner: any, addr1: any, addr2: any, addr3: any;
+describe("FundPoolFactory and FundPool", function () {
+  let factory: any;
+  let pool: any;
+  let owner: any;
+  let contributor1: any;
+  let contributor2: any;
+  let candidate1: any;
+  let candidate2: any;
 
-  beforeEach(async () => {
-    [owner, addr1, addr2, addr3] = await ethers.getSigners();
-    const Factory = await ethers.getContractFactory("FundsForAll");
-    contract = (await Factory.deploy()) as FundsForAll;
+  beforeEach(async function () {
+    [owner, contributor1, contributor2, candidate1, candidate2] = await ethers.getSigners();
+
+    const Factory = await ethers.getContractFactory("FundPoolFactory");
+    factory = await Factory.deploy();
+    await factory.deployed();
+
+    const tx = await factory.createFundPool("Test Pool", ethers.utils.parseEther("1"), 1);
+    const receipt = await tx.wait();
+    const poolAddress = receipt.events?.[0].args?.poolAddress;
+
+    pool = await ethers.getContractAt("FundPool", poolAddress);
   });
 
-  it("should create a new pool", async () => {
-    await contract.createPool("Save Earth", [addr1.address, addr2.address]);
-    const poolCount = await contract.poolCount();
-    expect(poolCount).to.equal(1);
+  it("should allow funding the pool", async function () {
+    await contributor1.sendTransaction({ to: pool.address, value: ethers.utils.parseEther("0.5") });
+    expect(await pool.getBalance()).to.equal(ethers.utils.parseEther("0.5"));
   });
 
-  it("should allow funding", async () => {
-    await contract.createPool("Health Aid", [addr1.address]);
-    await contract.fundPool(0, { value: ethers.parseEther("1.0") });
-    const poolData = await contract.poolCount();
-    expect(poolData).to.equal(1); // Basic check
+  it("should allow creator to add candidates", async function () {
+    await pool.connect(owner).addCandidate(candidate1.address);
+    const candidates = await pool.getCandidates();
+    expect(candidates).to.include(candidate1.address);
   });
 
-  it("should allow voting and withdrawal", async () => {
-    await contract.createPool("Vote Funds", [addr1.address, addr2.address]);
-    await contract.fundPool(0, { value: ethers.parseEther("1.0") });
+  it("should allow contributors to vote after pool closes and goal is met", async function () {
+    await pool.connect(owner).addCandidate(candidate1.address);
+    await contributor1.sendTransaction({ to: pool.address, value: ethers.utils.parseEther("1") });
 
-    await contract.connect(addr3).vote(0, addr1.address);
+    await ethers.provider.send("evm_increaseTime", [86400]); // 1 day
+    await ethers.provider.send("evm_mine", []);
+    await pool.connect(owner).closePool();
 
-    const votes = await contract.getVoteCount(0, addr1.address);
-    expect(votes).to.equal(1);
+    await pool.connect(contributor1).vote(candidate1.address);
+    expect(await pool.getCandidateVotes(candidate1.address)).to.equal(1);
+  });
 
-    const balanceBefore = await ethers.provider.getBalance(addr1.address);
-    const tx = await contract.withdraw(0);
+  it("should allow withdrawal to the winning candidate", async function () {
+    await pool.connect(owner).addCandidate(candidate1.address);
+    await contributor1.sendTransaction({ to: pool.address, value: ethers.utils.parseEther("1") });
+
+    await ethers.provider.send("evm_increaseTime", [86400]);
+    await ethers.provider.send("evm_mine", []);
+    await pool.connect(owner).closePool();
+    await pool.connect(contributor1).vote(candidate1.address);
+
+    const before = await ethers.provider.getBalance(candidate1.address);
+    const tx = await pool.connect(owner).withdrawToWinner();
     await tx.wait();
+    const after = await ethers.provider.getBalance(candidate1.address);
 
-    const balanceAfter = await ethers.provider.getBalance(addr1.address);
-    expect(balanceAfter).to.be.gt(balanceBefore); // Should receive funds
+    expect(after.sub(before)).to.be.gt(ethers.utils.parseEther("0.9"));
   });
 
-  it("should not allow double voting", async () => {
-    await contract.createPool("No Double Vote", [addr1.address]);
-    await contract.connect(addr2).vote(0, addr1.address);
-    await expect(contract.connect(addr2).vote(0, addr1.address)).to.be.revertedWith("Already voted");
-  });
+  it("should allow refund if goal not met", async function () {
+    await contributor1.sendTransaction({ to: pool.address, value: ethers.utils.parseEther("0.5") });
 
-  it("should not allow withdrawal before any votes", async () => {
-    await contract.createPool("No Votes", [addr1.address]);
-    await contract.fundPool(0, { value: ethers.parseEther("1.0") });
-    await expect(contract.withdraw(0)).to.be.revertedWith("No votes");
-  });
+    await ethers.provider.send("evm_increaseTime", [86400]);
+    await ethers.provider.send("evm_mine", []);
+    await pool.connect(owner).closePool();
 
-  it("should reject invalid candidate vote", async () => {
-    await contract.createPool("Invalid Vote", [addr1.address]);
-    await expect(contract.connect(addr2).vote(0, addr3.address)).to.be.revertedWith("Invalid candidate");
-  });
+    const before = await contributor1.getBalance();
+    const tx = await pool.connect(contributor1).claimRefund();
+    const receipt = await tx.wait();
+    const gas = receipt.gasUsed.mul(receipt.effectiveGasPrice);
+    const after = await contributor1.getBalance();
 
-  it("should emit events correctly", async () => {
-    await expect(contract.createPool("Event Pool", [addr1.address]))
-      .to.emit(contract, "PoolCreated")
-      .withArgs(0, owner.address, "Event Pool");
-
-    await expect(contract.fundPool(0, { value: ethers.parseEther("0.5") }))
-      .to.emit(contract, "Funded")
-      .withArgs(0, owner.address, ethers.parseEther("0.5"));
-
-    await contract.connect(addr2).vote(0, addr1.address);
-    await expect(contract.withdraw(0))
-      .to.emit(contract, "Withdrawn");
+    expect(after.add(gas)).to.be.closeTo(before, ethers.utils.parseEther("0.01"));
   });
 });
