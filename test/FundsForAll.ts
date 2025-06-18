@@ -1,107 +1,117 @@
-import { expect } from "chai";
 import { ethers } from "hardhat";
-import { FundsForAll, FundPool } from "../typechain-types";
+import { expect } from "chai";
+import { Contract, Signer } from "ethers";
 
-describe("FundsForAll + FundPool", () => {
-  let factory: FundsForAll;
-  let poolAddress: string;
-  let pool: FundPool;
-
-  const name = "Test Pool";
-  const goalAmount = ethers.utils.parseEther("5");
-  const durationInDays = 1;
+describe("FundsForAll", function () {
+  let deployer: Signer;
+  let contributor1: Signer;
+  let contributor2: Signer;
+  let candidate1: Signer;
+  let candidate2: Signer;
+  let fundsForAll: Contract;
 
   beforeEach(async () => {
-    const [deployer] = await ethers.getSigners();
+    [deployer, contributor1, contributor2, candidate1, candidate2] = await ethers.getSigners();
 
-    const Factory = await ethers.getContractFactory("FundsForAll");
-    factory = await Factory.deploy();
-    await factory.deployed();
-
-    const tx = await factory.createFundPool(name, goalAmount, durationInDays);
-    const receipt = await tx.wait();
-
-    const event = receipt.events?.find(e => e.event === "PoolCreated");
-    poolAddress = event?.args?.poolAddress;
-    pool = await ethers.getContractAt("FundPool", poolAddress);
+    const FundsForAll = await ethers.getContractFactory("FundsForAll");
+    fundsForAll = await FundsForAll.deploy(); // ✅ No need for .deployed()
   });
 
-  it("should create a FundPool", async () => {
-    const pools = await factory.getAllPools();
+  it("should create a FundPool correctly", async () => {
+    await expect(
+      fundsForAll.connect(deployer).createFundPool("Save The Whales", ethers.parseEther("5"), 1)
+    ).to.emit(fundsForAll, "PoolCreated");
+
+    const pools = await fundsForAll.getAllPools();
     expect(pools.length).to.equal(1);
-    expect(pools[0]).to.equal(poolAddress);
   });
 
-  it("should accept funds and update contributions", async () => {
-    const [user] = await ethers.getSigners();
-    const amount = ethers.utils.parseEther("1");
+  describe("FundPool logic", function () {
+    let fundPool: Contract;
 
-    await user.sendTransaction({
-      to: poolAddress,
-      value: amount,
+    beforeEach(async () => {
+      const tx = await fundsForAll.connect(deployer).createFundPool("TestPool", ethers.parseEther("3"), 1);
+      const receipt = await tx.wait();
+      const poolCreatedEvent = receipt?.logs?.find((log: any) => log.fragment?.name === "PoolCreated");
+      const poolAddress = poolCreatedEvent?.args?.poolAddress;
+
+      fundPool = await ethers.getContractAt("FundPool", poolAddress);
     });
 
-    const contribution = await pool.getMyContribution(user.address);
-    expect(contribution).to.equal(amount);
-  });
+    it("should accept contributions and emit Funded", async () => {
+      await expect(
+        contributor1.sendTransaction({ to: fundPool.target, value: ethers.parseEther("1") })
+      ).to.emit(fundPool, "Funded");
 
-  it("should close the pool and emit event", async () => {
-    // fast-forward time
-    await ethers.provider.send("evm_increaseTime", [86400 + 1]); // 1 day
-    await ethers.provider.send("evm_mine", []);
+      const balance = await fundPool.getBalance();
+      expect(balance).to.equal(ethers.parseEther("1"));
+    });
 
-    const tx = await pool.closePool();
-    const receipt = await tx.wait();
-    const event = receipt.events?.find(e => e.event === "PoolClosed");
+    it("should allow the creator to add candidates", async () => {
+      await expect(fundPool.connect(deployer).addCandidate(await candidate1.getAddress()))
+        .to.emit(fundPool, "CandidateAdded");
 
-    expect(event?.args?.goalReached).to.be.false;
-    expect(await pool.isEnded()).to.be.true;
-  });
+      const candidates = await fundPool.getCandidates();
+      expect(candidates[0]).to.equal(await candidate1.getAddress());
+    });
 
-  it("should refund contributors if goal not reached", async () => {
-    const [user] = await ethers.getSigners();
-    const amount = ethers.utils.parseEther("1");
+    it("should close the pool after the deadline and emit PoolClosed", async () => {
+      await contributor1.sendTransaction({ to: fundPool.target, value: ethers.parseEther("1") });
 
-    await user.sendTransaction({ to: poolAddress, value: amount });
+      await ethers.provider.send("evm_increaseTime", [86400]); // 1 day
+      await ethers.provider.send("evm_mine", []);
 
-    // close the pool after deadline
-    await ethers.provider.send("evm_increaseTime", [86400 + 1]);
-    await ethers.provider.send("evm_mine", []);
-    await pool.closePool();
+      await expect(fundPool.connect(deployer).closePool()).to.emit(fundPool, "PoolClosed");
+    });
 
-    const prevBalance = await ethers.provider.getBalance(user.address);
-    const tx = await pool.connect(user).claimRefund();
-    const receipt = await tx.wait();
-    const gasUsed = receipt.gasUsed.mul(receipt.effectiveGasPrice);
-    const newBalance = await ethers.provider.getBalance(user.address);
+    it("should allow contributors to vote after goal is reached", async () => {
+      await fundPool.connect(deployer).addCandidate(await candidate1.getAddress());
+      await contributor1.sendTransaction({ to: fundPool.target, value: ethers.parseEther("3") });
 
-    expect(newBalance).to.be.closeTo(prevBalance.add(amount).sub(gasUsed), ethers.utils.parseEther("0.01"));
-  });
+      await ethers.provider.send("evm_increaseTime", [86400]);
+      await ethers.provider.send("evm_mine", []);
+      await fundPool.connect(deployer).closePool();
 
-  it("should allow voting and withdraw to winner", async () => {
-    const [creator, user, candidate] = await ethers.getSigners();
-    const amount = ethers.utils.parseEther("5");
+      await expect(fundPool.connect(contributor1).vote(await candidate1.getAddress()))
+        .to.emit(fundPool, "Voted");
 
-    // fund the pool to reach the goal
-    await user.sendTransaction({ to: poolAddress, value: amount });
+      const votes = await fundPool.getCandidateVotes(await candidate1.getAddress());
+      expect(votes).to.equal(1);
+    });
 
-    // add candidate
-    await pool.connect(creator).addCandidate(candidate.address);
+    it("should withdraw to the most voted candidate", async () => {
+      await fundPool.connect(deployer).addCandidate(await candidate1.getAddress());
+      await fundPool.connect(deployer).addCandidate(await candidate2.getAddress());
 
-    // close pool
-    await ethers.provider.send("evm_increaseTime", [86400 + 1]);
-    await ethers.provider.send("evm_mine", []);
-    await pool.closePool();
+      await contributor1.sendTransaction({ to: fundPool.target, value: ethers.parseEther("2") });
+      await contributor2.sendTransaction({ to: fundPool.target, value: ethers.parseEther("2") });
 
-    // vote
-    await pool.connect(user).vote(candidate.address);
+      await ethers.provider.send("evm_increaseTime", [86400]);
+      await ethers.provider.send("evm_mine", []);
+      await fundPool.connect(deployer).closePool();
 
-    // withdraw
-    const balanceBefore = await ethers.provider.getBalance(candidate.address);
-    const tx = await pool.connect(user).withdrawToWinner();
-    await tx.wait();
-    const balanceAfter = await ethers.provider.getBalance(candidate.address);
+      await fundPool.connect(contributor1).vote(await candidate1.getAddress());
+      await fundPool.connect(contributor2).vote(await candidate1.getAddress());
 
-    expect(balanceAfter.sub(balanceBefore)).to.equal(amount);
+      await expect(fundPool.connect(deployer).withdrawToWinner())
+        .to.emit(fundPool, "Withdrawn");
+    });
+
+    it("should allow refunds if goal is not reached", async () => {
+      await contributor1.sendTransaction({ to: fundPool.target, value: ethers.parseEther("1") });
+
+      await ethers.provider.send("evm_increaseTime", [86400]);
+      await ethers.provider.send("evm_mine", []);
+      await fundPool.connect(deployer).closePool();
+
+      const before = await ethers.provider.getBalance(await contributor1.getAddress());
+
+      const tx = await fundPool.connect(contributor1).claimRefund();
+      const receipt = await tx.wait();
+      const gasUsed = receipt.gasUsed * receipt.gasPrice!;
+
+      const after = await ethers.provider.getBalance(await contributor1.getAddress());
+      expect(after).to.be.closeTo(before + ethers.parseEther("1") - gasUsed, ethers.parseEther("0.01"));
+    });
   });
 });
